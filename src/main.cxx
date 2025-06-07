@@ -71,6 +71,7 @@ private:
 	{
 		createInstance();
 		getAdapter();
+		getDevice();
 	}
 
 	void createInstance()
@@ -187,7 +188,9 @@ private:
 		deviceSupportedLimits.nextInChain = nullptr;
 		wgpuDeviceGetLimits(device, &deviceSupportedLimits);
 
+#ifdef DEBUG_MODE
 		logDevice();
+#endif
 	}
 
 	void logAdapter()
