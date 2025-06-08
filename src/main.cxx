@@ -39,8 +39,8 @@ public:
 	void run()
 	{
 		initializeGLFW();
-		initializeWGPU();
 		createWindow();
+		initializeWGPU();
 		windowLoop();
 		terminateApplication();
 	}
@@ -57,6 +57,10 @@ private:
 	WGPUInstance instance;
 	WGPUAdapter adapter;
 	WGPUDevice device;
+	WGPUQueue queue;
+	WGPUSurface surface;
+	WGPUCommandEncoder encoder;
+	WGPUCommandBuffer commandBuffer;
 
 private:
 	void initializeGLFW()
@@ -72,6 +76,7 @@ private:
 		createInstance();
 		getAdapter();
 		getDevice();
+		getQueue();
 	}
 
 	void createInstance()
@@ -110,6 +115,8 @@ private:
 	{
 		while (!glfwWindowShouldClose(window))
 		{
+			renderFrame();
+
 			glfwPollEvents();
 		}
 	}
@@ -118,13 +125,65 @@ private:
 	{
 		glfwDestroyWindow(window);
 		glfwTerminate();
+
+		wgpuQueueRelease(queue);
+		wgpuSurfaceUnconfigure(surface);
+		wgpuSurfaceRelease(surface);
+	}
+
+	void renderFrame()
+	{
+		std::pair<WGPUSurfaceTexture, WGPUTextureView> surfaceData = getNextSurfaceViewData();
+		WGPUSurfaceTexture surfaceTexture = surfaceData.first;
+		WGPUTextureView targetView = surfaceData.second;
+
+		if (!targetView) return;
+
+		WGPUCommandEncoderDescriptor encoderDesc = {};
+		encoderDesc.nextInChain = nullptr;
+		encoderDesc.label = "Command Encoder Descriptor";
+		encoder = wgpuDeviceCreateCommandEncoder(device, &encoderDesc);
+
+		WGPURenderPassColorAttachment renderPassColorAttachment = {};
+		renderPassColorAttachment.view = targetView;
+		renderPassColorAttachment.resolveTarget = nullptr;
+		renderPassColorAttachment.loadOp = WGPULoadOp_Clear;
+		renderPassColorAttachment.storeOp = WGPUStoreOp_Store;
+		renderPassColorAttachment.clearValue = WGPUColor{ 0.9, 0.1, 0.0, 1.0 };
+
+		WGPURenderPassDescriptor renderPassDesc = {};
+		renderPassDesc.nextInChain = nullptr;
+		renderPassDesc.colorAttachmentCount = 1;
+		renderPassDesc.colorAttachments = &renderPassColorAttachment;
+		renderPassDesc.depthStencilAttachment = nullptr;
+		renderPassDesc.timestampWrites = nullptr;
+		WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
+
+		wgpuRenderPassEncoderEnd(renderPass);
+		wgpuRenderPassEncoderRelease(renderPass);
+
+		WGPUCommandBufferDescriptor commandBufferDesc = {};
+		commandBufferDesc.nextInChain = nullptr;
+		commandBufferDesc.label = "Command Buffer";
+		commandBuffer = wgpuCommandEncoderFinish(encoder, &commandBufferDesc);
+
+		wgpuQueueSubmit(queue, 1, &commandBuffer);
+		wgpuCommandBufferRelease(commandBuffer);
+
+		wgpuTextureViewRelease(targetView);
+		wgpuSurfacePresent(surface);
+		wgpuTextureRelease(surfaceTexture.texture);
 	}
 
 	void getAdapter()
 	{
+		surface = glfwGetWGPUSurface(instance, window);
+
 		WGPURequestAdapterOptions adapterOpts{};
 		adapterOpts.nextInChain = nullptr;
+		adapterOpts.compatibleSurface = surface;
 		adapter = requestAdapterSync(instance, adapterOpts);
+		wgpuInstanceRelease(instance);
 
 		if (!adapter)
 		{
@@ -170,6 +229,8 @@ private:
 			};
 
 		device = requestDeviceSync(adapter, &deviceDesc);
+		configSurface();
+		wgpuAdapterRelease(adapter);
 
 		if (!device)
 		{
@@ -191,6 +252,37 @@ private:
 #ifdef DEBUG_MODE
 		logDevice();
 #endif
+	}
+
+	void getQueue()
+	{
+		queue = wgpuDeviceGetQueue(device);
+
+		auto onQueueWorkDone =
+			[](WGPUQueueWorkDoneStatus arg_WorkDoneStatus, void*)
+			{
+				LOG_MSG_SUC("Queue work finished with status: " << arg_WorkDoneStatus);
+			};
+
+		wgpuQueueOnSubmittedWorkDone(queue, onQueueWorkDone, nullptr);
+	}
+
+	void configSurface() const
+	{
+		WGPUSurfaceConfiguration surfaceConfig = {};
+		WGPUTextureFormat textureFormat = wgpuSurfaceGetPreferredFormat(surface, adapter);
+		surfaceConfig.nextInChain = nullptr;
+		surfaceConfig.width = WindowProperties::WINDOW_WIDTH;
+		surfaceConfig.height = WindowProperties::WINDOW_WIDTH;
+		surfaceConfig.format = textureFormat;
+		surfaceConfig.viewFormatCount = 0;
+		surfaceConfig.viewFormats = nullptr;
+		surfaceConfig.usage = WGPUTextureUsage_RenderAttachment;
+		surfaceConfig.device = device;
+		surfaceConfig.presentMode = WGPUPresentMode_Fifo;
+		surfaceConfig.alphaMode = WGPUCompositeAlphaMode_Auto;
+		
+		wgpuSurfaceConfigure(surface, &surfaceConfig);
 	}
 
 	void logAdapter()
@@ -235,6 +327,31 @@ private:
 		std::cout << " - maxTextureDimension2D: " << deviceSupportedLimits.limits.maxTextureDimension2D << '\n';
 		std::cout << " - maxTextureDimension3D: " << deviceSupportedLimits.limits.maxTextureDimension3D << '\n';
 		std::cout << " - maxTextureArrayLayers: " << deviceSupportedLimits.limits.maxTextureArrayLayers << '\n';
+	}
+
+	std::pair<WGPUSurfaceTexture, WGPUTextureView> getNextSurfaceViewData()
+	{
+		WGPUSurfaceTexture surfaceTexture;
+		wgpuSurfaceGetCurrentTexture(surface, &surfaceTexture);
+
+		if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_Success)
+		{
+			return { surfaceTexture, nullptr };
+		}
+
+		WGPUTextureViewDescriptor viewDescriptor;
+		viewDescriptor.nextInChain = nullptr;
+		viewDescriptor.label = "Surface texture view";
+		viewDescriptor.format = wgpuTextureGetFormat(surfaceTexture.texture);
+		viewDescriptor.dimension = WGPUTextureViewDimension_2D;
+		viewDescriptor.baseMipLevel = 0;
+		viewDescriptor.mipLevelCount = 1;
+		viewDescriptor.baseArrayLayer = 0;
+		viewDescriptor.arrayLayerCount = 1;
+		viewDescriptor.aspect = WGPUTextureAspect_All;
+		WGPUTextureView targetView = wgpuTextureCreateView(surfaceTexture.texture, &viewDescriptor);
+
+		return { surfaceTexture, targetView };
 	}
 
 	WGPUAdapter requestAdapterSync(WGPUInstance arg_Instance, WGPURequestAdapterOptions arg_RequestAdapterOpts)
@@ -301,7 +418,7 @@ private:
 				if (arg_RequestDeviceStatus == WGPURequestDeviceStatus_Success)
 				{
 					userData.device = arg_Device;
-					LOG_MSG_SUC("Got device successfully");
+					LOG_MSG_SUC("\nGot device successfully");
 				}
 				else
 				{
