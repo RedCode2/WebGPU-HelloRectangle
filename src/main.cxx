@@ -22,6 +22,30 @@
 
 #endif
 
+const char* shaderSource = R"(
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
+	var p = vec2f(0.0, 0.0);
+	
+	if (in_vertex_index == 0u) {
+		p = vec2f(-0.5, -0.5);
+	}
+	else if (in_vertex_index == 1u) {
+		p = vec2f(0.5, -0.5);
+	}
+	else {
+		p = vec2f(0.0, 0.5);
+	}
+	
+	return vec4f(p, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+	return vec4f(0.0, 0.4, 1.0, 1.0);
+}
+)";
+
 namespace WindowProperties
 {
 	const int WINDOW_WIDTH = 640;
@@ -53,14 +77,14 @@ private:
 	WGPUAdapterProperties adapterProperties;
 	WGPUSupportedLimits adapterSupportedLimits;
 	WGPUSupportedLimits deviceSupportedLimits;
+	WGPUTextureFormat surfaceFormat;
 
 	WGPUInstance instance;
 	WGPUAdapter adapter;
 	WGPUDevice device;
 	WGPUQueue queue;
 	WGPUSurface surface;
-	WGPUCommandEncoder encoder;
-	WGPUCommandBuffer commandBuffer;
+	WGPURenderPipeline pipeline;
 
 private:
 	void initializeGLFW()
@@ -77,6 +101,7 @@ private:
 		getAdapter();
 		getDevice();
 		getQueue();
+		InitializeRenderPipeline();
 	}
 
 	void createInstance()
@@ -92,6 +117,19 @@ private:
 		}
 
 		LOG_MSG_SUC("WebGPU instance: " << instance);
+	}
+
+	void createShaderModule(WGPUShaderModule& arg_ShaderModule) const
+	{
+		WGPUShaderModuleWGSLDescriptor shaderWGSLDesc{};
+		shaderWGSLDesc.chain.next = nullptr;
+		shaderWGSLDesc.chain.sType = WGPUSType_ShaderModuleWGSLDescriptor;
+		shaderWGSLDesc.code = shaderSource;
+
+		WGPUShaderModuleDescriptor shaderDesc{};
+		shaderDesc.nextInChain = &shaderWGSLDesc.chain;
+
+		arg_ShaderModule = wgpuDeviceCreateShaderModule(device, &shaderDesc);
 	}
 
 	void createWindow()
@@ -123,6 +161,8 @@ private:
 
 	void terminateApplication()
 	{
+		wgpuRenderPipelineRelease(pipeline);
+
 		glfwDestroyWindow(window);
 		glfwTerminate();
 
@@ -140,39 +180,37 @@ private:
 		if (!targetView) return;
 
 		WGPUCommandEncoderDescriptor encoderDesc = {};
-		encoderDesc.nextInChain = nullptr;
-		encoderDesc.label = "Command Encoder Descriptor";
-		encoder = wgpuDeviceCreateCommandEncoder(device, &encoderDesc);
+		encoderDesc.label = "Command Encoder";
+		WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encoderDesc);
 
 		WGPURenderPassColorAttachment renderPassColorAttachment = {};
 		renderPassColorAttachment.view = targetView;
-		renderPassColorAttachment.resolveTarget = nullptr;
 		renderPassColorAttachment.loadOp = WGPULoadOp_Clear;
 		renderPassColorAttachment.storeOp = WGPUStoreOp_Store;
-		renderPassColorAttachment.clearValue = WGPUColor{ 0.9, 0.1, 0.0, 1.0 };
+		renderPassColorAttachment.clearValue = WGPUColor{ 0.9, 0.1, 0.2, 1.0 };
 
 		WGPURenderPassDescriptor renderPassDesc = {};
-		renderPassDesc.nextInChain = nullptr;
 		renderPassDesc.colorAttachmentCount = 1;
 		renderPassDesc.colorAttachments = &renderPassColorAttachment;
-		renderPassDesc.depthStencilAttachment = nullptr;
-		renderPassDesc.timestampWrites = nullptr;
 		WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
 
+		wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
+		wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+
 		wgpuRenderPassEncoderEnd(renderPass);
-		wgpuRenderPassEncoderRelease(renderPass);
 
 		WGPUCommandBufferDescriptor commandBufferDesc = {};
-		commandBufferDesc.nextInChain = nullptr;
 		commandBufferDesc.label = "Command Buffer";
-		commandBuffer = wgpuCommandEncoderFinish(encoder, &commandBufferDesc);
-
+		WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder, &commandBufferDesc);
 		wgpuQueueSubmit(queue, 1, &commandBuffer);
-		wgpuCommandBufferRelease(commandBuffer);
 
-		wgpuTextureViewRelease(targetView);
 		wgpuSurfacePresent(surface);
+
+		wgpuCommandBufferRelease(commandBuffer);
+		wgpuTextureViewRelease(targetView);
+		
 		wgpuTextureRelease(surfaceTexture.texture);
+		wgpuCommandEncoderRelease(encoder);
 	}
 
 	void getAdapter()
@@ -283,6 +321,59 @@ private:
 		surfaceConfig.alphaMode = WGPUCompositeAlphaMode_Auto;
 		
 		wgpuSurfaceConfigure(surface, &surfaceConfig);
+	}
+
+	void InitializeRenderPipeline()
+	{
+		WGPUShaderModule shaderModule;
+		createShaderModule(shaderModule);
+
+		surfaceFormat = wgpuSurfaceGetPreferredFormat(surface, adapter);
+
+		WGPUBlendState blendState{};
+		blendState.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+		blendState.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+		blendState.color.operation = WGPUBlendOperation_Add;
+
+		blendState.alpha.srcFactor = WGPUBlendFactor_Zero;
+		blendState.alpha.dstFactor = WGPUBlendFactor_One;
+		blendState.alpha.operation = WGPUBlendOperation_Add;
+
+		WGPUColorTargetState colorTarget{};
+		colorTarget.format = surfaceFormat;
+		colorTarget.blend = &blendState;
+		colorTarget.writeMask = WGPUColorWriteMask_All;
+
+		WGPURenderPipelineDescriptor pipelineDesc{};
+		pipelineDesc.nextInChain = nullptr;
+		pipelineDesc.vertex.bufferCount = 0;
+		pipelineDesc.vertex.buffers = nullptr;
+		pipelineDesc.vertex.module = shaderModule;
+		pipelineDesc.vertex.entryPoint = "vs_main";
+		pipelineDesc.vertex.constantCount = 0;
+		pipelineDesc.vertex.constants = nullptr;
+
+		pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+		pipelineDesc.primitive.stripIndexFormat = WGPUIndexFormat_Undefined;
+		pipelineDesc.primitive.frontFace = WGPUFrontFace_CCW;
+		pipelineDesc.primitive.cullMode = WGPUCullMode_None;
+
+		WGPUFragmentState fragmentState{};
+		fragmentState.module = shaderModule;
+		fragmentState.entryPoint = "fs_main";
+		fragmentState.constantCount = 0;
+		fragmentState.constants = nullptr;
+		fragmentState.targetCount = 1;
+		fragmentState.targets = &colorTarget;
+
+		pipelineDesc.fragment = &fragmentState;
+		pipelineDesc.depthStencil = nullptr;
+
+		pipelineDesc.multisample.count = 1;
+		pipelineDesc.multisample.mask = ~0u;
+		pipelineDesc.multisample.alphaToCoverageEnabled = false;
+		
+		pipeline = wgpuDeviceCreateRenderPipeline(device, &pipelineDesc);
 	}
 
 	void logAdapter()
