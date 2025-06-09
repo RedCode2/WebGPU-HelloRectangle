@@ -26,14 +26,27 @@
 #endif
 
 const char* shaderSource = R"(
+struct VertexInput {
+	@location(0) position: vec2f,
+	@location(1) color: vec3f,
+};
+
+struct VertexOutput {
+	@builtin(position) position: vec4f,
+	@location(0) color: vec3f,
+}
+
 @vertex
-fn vs_main(@location(0) in_vertex_position: vec2f) -> @builtin(position) vec4f {
-	return vec4f(in_vertex_position, 0.0, 1.0);
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput; 
+    out.position = vec4f(in.position, 0.0, 1.0); 
+    out.color = in.color; 
+    return out;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4f {
-	return vec4f(1.0, 0.0, 0.0, 1.0);
+fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+    return vec4f(in.color, 1.0);
 }
 )";
 
@@ -51,11 +64,16 @@ void wgpuPollEvents([[maybe_unused]] WGPUDevice device, [[maybe_unused]] bool yi
 
 namespace WindowProperties
 {
-	const int WINDOW_WIDTH = 640;
-	const int WINDOW_HEIGHT = 480;
+	const int WINDOW_WIDTH = 1280;
+	const int WINDOW_HEIGHT = 960;
 	const char* WINDOW_TITLE = "WebGPU C++ Hello Triangle";
+	WGPUColor clearColor = { 0.0, 0.0, 0.006, 1.0 };
 	GLFWmonitor* monitor = nullptr;
 	GLFWwindow* share = nullptr;
+
+	const float MIN_BLUE = 0.006f;
+	const float MAX_BLUE = 0.08f;
+	const float FADE_SPEED = 0.0004f;
 }
 
 class Application
@@ -76,6 +94,7 @@ private:
 	GLFWwindow* window;
 
 	uint32_t vertexCount;
+	bool bgFadingUp = true;
 
 	std::vector<WGPUFeatureName> adapterFeatures;
 	std::vector<WGPUFeatureName> deviceFeatures;
@@ -195,7 +214,22 @@ private:
 		renderPassColorAttachment.view = targetView;
 		renderPassColorAttachment.loadOp = WGPULoadOp_Clear;
 		renderPassColorAttachment.storeOp = WGPUStoreOp_Store;
-		renderPassColorAttachment.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
+		renderPassColorAttachment.clearValue = WindowProperties::clearColor;
+
+		if (bgFadingUp) {
+			WindowProperties::clearColor.b += WindowProperties::FADE_SPEED;
+			if (WindowProperties::clearColor.b >= WindowProperties::MAX_BLUE) {
+				WindowProperties::clearColor.b = WindowProperties::MAX_BLUE;
+				bgFadingUp = false;
+			}
+		}
+		else {
+			WindowProperties::clearColor.b -= WindowProperties::FADE_SPEED;
+			if (WindowProperties::clearColor.b <= WindowProperties::MIN_BLUE) {
+				WindowProperties::clearColor.b = WindowProperties::MIN_BLUE;
+				bgFadingUp = true; 
+			}
+		}
 
 		WGPURenderPassDescriptor renderPassDesc = {};
 		renderPassDesc.colorAttachmentCount = 1;
@@ -225,17 +259,12 @@ private:
 	void initializeBuffers()
 	{
 		std::vector<float> vertexData = {
-			
-			-0.5, -0.5,
-			+0.5, -0.5,
-			+0.5, +0.5,
-
-			+0.5, +0.5,
-			-0.5, +0.5,
-			-0.5, -0.5
+			-0.5,	-0.5, 1.0, 0.0, 0.0,
+			+0.5,	-0.5, 0.0, 1.0, 0.0,
+			+0.0,   +0.5, 0.0, 0.0, 1.0
 		};
 
-		vertexCount = static_cast<uint32_t>(vertexData.size() / 2);
+		vertexCount = static_cast<uint32_t>(vertexData.size() / 5);
 
 		WGPUBufferDescriptor vertexBufferDesc{};
 		vertexBufferDesc.nextInChain = nullptr;
@@ -377,15 +406,20 @@ private:
 		WGPUShaderModule shaderModule;
 		createShaderModule(shaderModule);
 
-		WGPUVertexAttribute positionAttrib;
-		positionAttrib.shaderLocation = 0;
-		positionAttrib.format = WGPUVertexFormat_Float32x2;
-		positionAttrib.offset = 0;
+		std::vector<WGPUVertexAttribute> vertexAttrib(2);
+
+		vertexAttrib[0].shaderLocation = 0;
+		vertexAttrib[0].format = WGPUVertexFormat_Float32x2;
+		vertexAttrib[0].offset = 0;
+
+		vertexAttrib[1].shaderLocation = 1;
+		vertexAttrib[1].format = WGPUVertexFormat_Float32x3;
+		vertexAttrib[1].offset = 2 * sizeof(float);
 
 		WGPUVertexBufferLayout vertexBufferLayout{};
-		vertexBufferLayout.attributeCount = 1;
-		vertexBufferLayout.attributes = &positionAttrib;
-		vertexBufferLayout.arrayStride = 2 * sizeof(float);
+		vertexBufferLayout.attributeCount = 2;
+		vertexBufferLayout.attributes = vertexAttrib.data();
+		vertexBufferLayout.arrayStride = 5 * sizeof(float);
 		vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
 
 		surfaceFormat = wgpuSurfaceGetPreferredFormat(surface, adapter);
@@ -641,12 +675,13 @@ private:
 		WGPURequiredLimits requiredLimits{};
 		limitsSetDefault(requiredLimits.limits);
 
-		requiredLimits.limits.maxVertexAttributes = 1;
+		requiredLimits.limits.maxVertexAttributes = 2;
 		requiredLimits.limits.maxVertexBufferArrayStride = 1;
-		requiredLimits.limits.maxBufferSize = 2 * 6 * sizeof(float);
-		requiredLimits.limits.maxVertexBufferArrayStride = 2 * sizeof(float);
+		requiredLimits.limits.maxBufferSize = 5 * 6 * sizeof(float);
+		requiredLimits.limits.maxVertexBufferArrayStride = 5 * sizeof(float);
 		requiredLimits.limits.minStorageBufferOffsetAlignment = adapterSupportedLimits.limits.minStorageBufferOffsetAlignment;
 		requiredLimits.limits.minUniformBufferOffsetAlignment = adapterSupportedLimits.limits.minUniformBufferOffsetAlignment;
+		requiredLimits.limits.maxInterStageShaderComponents = 3;
 
 		return requiredLimits;
 	}
