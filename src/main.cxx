@@ -1,14 +1,15 @@
-#define DEBUG_MODE
-
 #include <iostream>
 #include <stdexcept>
 #include <cstdint>
 #include <cassert>
 #include <vector>
+#include <chrono>
+#include <thread>
 
 #include <glfw3webgpu.h>
 #include <GLFW/glfw3.h>
 #include <webgpu/webgpu.h>
+#include <webgpu/wgpu.h>
 
 #ifdef DEBUG_MODE
 
@@ -46,6 +47,18 @@ fn fs_main() -> @location(0) vec4f {
 }
 )";
 
+void wgpuPollEvents([[maybe_unused]] WGPUDevice device, [[maybe_unused]] bool yieldToWebBrowser) {
+#if defined(WEBGPU_BACKEND_DAWN)
+	wgpuDeviceTick(device);
+#elif defined(WEBGPU_BACKEND_WGPU)
+	wgpuDevicePoll(device, false, nullptr);
+#elif defined(WEBGPU_BACKEND_EMSCRIPTEN)
+	if (yieldToWebBrowser) {
+		emscripten_sleep(100);
+	}
+#endif
+}
+
 namespace WindowProperties
 {
 	const int WINDOW_WIDTH = 640;
@@ -78,6 +91,8 @@ private:
 	WGPUSupportedLimits adapterSupportedLimits;
 	WGPUSupportedLimits deviceSupportedLimits;
 	WGPUTextureFormat surfaceFormat;
+	WGPUBuffer buffer1;
+	WGPUBuffer buffer2;
 
 	WGPUInstance instance;
 	WGPUAdapter adapter;
@@ -101,7 +116,8 @@ private:
 		getAdapter();
 		getDevice();
 		getQueue();
-		InitializeRenderPipeline();
+		createBuffer();
+		initializeRenderPipeline();
 	}
 
 	void createInstance()
@@ -149,6 +165,75 @@ private:
 		}
 	}
 
+	void createBuffer()
+	{
+		WGPUBufferDescriptor bufferDesc = {};
+		bufferDesc.nextInChain = nullptr;
+		bufferDesc.label = "Some GPU-side data buffer";
+		bufferDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc;
+		bufferDesc.size = 16;
+		bufferDesc.mappedAtCreation = false;
+		buffer1 = wgpuDeviceCreateBuffer(device, &bufferDesc);
+
+		bufferDesc.label = "Output buffer";
+		bufferDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+		buffer2 = wgpuDeviceCreateBuffer(device, &bufferDesc);
+
+		std::vector<uint8_t> numbers(16);
+		for (uint8_t i = 0; i < 16; ++i) numbers[i] = i;
+
+		wgpuQueueWriteBuffer(queue, buffer1, 0, numbers.data(), numbers.size());
+
+		WGPUCommandEncoderDescriptor encoderDesc{};
+		encoderDesc.nextInChain = nullptr;
+		encoderDesc.label = "Command encoder";
+		WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encoderDesc);
+
+		wgpuCommandEncoderCopyBufferToBuffer(encoder, buffer1, 0, buffer2, 0, 16);
+
+		WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, nullptr);
+		wgpuCommandEncoderRelease(encoder);
+		wgpuQueueSubmit(queue, 1, &command);
+		wgpuCommandBufferRelease(command);
+
+		struct Context 
+		{
+			bool ready;
+			WGPUBuffer buffer;
+		};
+
+		auto onBuffer2Mapped = 
+			[](WGPUBufferMapAsyncStatus status, void* pUserData) 
+			{
+				Context* context = reinterpret_cast<Context*>(pUserData);
+				context->ready = true;
+				std::cout << "\nBuffer 2 mapped with status " << status << '\n';
+				if (status != WGPUBufferMapAsyncStatus_Success) return;
+
+				uint8_t* bufferData = (uint8_t*)wgpuBufferGetConstMappedRange(context->buffer, 0, 16);
+
+				std::cout << "bufferData = [";
+				for (int i = 0; i < 16; ++i) {
+					if (i > 0) std::cout << ", ";
+					std::cout << (int)bufferData[i];
+				}
+				std::cout << "]" << std::endl;
+
+				wgpuBufferUnmap(context->buffer);
+			};
+
+		// Create the Context instance
+		Context context{};
+		context.ready = false;
+		context.buffer = buffer2;
+
+		wgpuBufferMapAsync(buffer2, WGPUMapMode_Read, 0, 16, onBuffer2Mapped, (void*)&context);
+
+		while (!context.ready) {
+			wgpuPollEvents(device, true);
+		}
+	}
+
 	void windowLoop()
 	{
 		while (!glfwWindowShouldClose(window))
@@ -169,6 +254,8 @@ private:
 		wgpuQueueRelease(queue);
 		wgpuSurfaceUnconfigure(surface);
 		wgpuSurfaceRelease(surface);
+		wgpuBufferRelease(buffer1);
+		wgpuBufferRelease(buffer2);
 	}
 
 	void renderFrame()
@@ -299,7 +386,7 @@ private:
 		auto onQueueWorkDone =
 			[](WGPUQueueWorkDoneStatus arg_WorkDoneStatus, void*)
 			{
-				LOG_MSG_SUC("Queue work finished with status: " << arg_WorkDoneStatus);
+				std::cout << "Queue work finished with status: " << arg_WorkDoneStatus;
 			};
 
 		wgpuQueueOnSubmittedWorkDone(queue, onQueueWorkDone, nullptr);
@@ -323,7 +410,7 @@ private:
 		wgpuSurfaceConfigure(surface, &surfaceConfig);
 	}
 
-	void InitializeRenderPipeline()
+	void initializeRenderPipeline()
 	{
 		WGPUShaderModule shaderModule;
 		createShaderModule(shaderModule);
@@ -545,6 +632,6 @@ int main() try
 }
 catch (const std::exception& err)
 {
-	LOG_MSG_ERR(err.what());
+	std::cerr << err.what();
 	return EXIT_FAILURE;
 }
