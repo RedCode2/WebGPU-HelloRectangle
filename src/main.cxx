@@ -1,4 +1,6 @@
-#include <iostream>
+#ifdef DEBUG_MODE
+	#include <iostream>
+#endif
 #include <stdexcept>
 #include <cstdint>
 #include <cassert>
@@ -25,25 +27,13 @@
 
 const char* shaderSource = R"(
 @vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
-	var p = vec2f(0.0, 0.0);
-	
-	if (in_vertex_index == 0u) {
-		p = vec2f(-0.5, -0.5);
-	}
-	else if (in_vertex_index == 1u) {
-		p = vec2f(0.5, -0.5);
-	}
-	else {
-		p = vec2f(0.0, 0.5);
-	}
-	
-	return vec4f(p, 0.0, 1.0);
+fn vs_main(@location(0) in_vertex_position: vec2f) -> @builtin(position) vec4f {
+	return vec4f(in_vertex_position, 0.0, 1.0);
 }
 
 @fragment
 fn fs_main() -> @location(0) vec4f {
-	return vec4f(0.0, 0.4, 1.0, 1.0);
+	return vec4f(1.0, 0.0, 0.0, 1.0);
 }
 )";
 
@@ -63,7 +53,7 @@ namespace WindowProperties
 {
 	const int WINDOW_WIDTH = 640;
 	const int WINDOW_HEIGHT = 480;
-	const char* WINDOW_TITLE = "WebGPU Hello Triangle";
+	const char* WINDOW_TITLE = "WebGPU C++ Hello Triangle";
 	GLFWmonitor* monitor = nullptr;
 	GLFWwindow* share = nullptr;
 }
@@ -85,14 +75,15 @@ public:
 private:
 	GLFWwindow* window;
 
+	uint32_t vertexCount;
+
 	std::vector<WGPUFeatureName> adapterFeatures;
 	std::vector<WGPUFeatureName> deviceFeatures;
 	WGPUAdapterProperties adapterProperties;
 	WGPUSupportedLimits adapterSupportedLimits;
 	WGPUSupportedLimits deviceSupportedLimits;
 	WGPUTextureFormat surfaceFormat;
-	WGPUBuffer buffer1;
-	WGPUBuffer buffer2;
+	WGPUBuffer vertexBuffer;
 
 	WGPUInstance instance;
 	WGPUAdapter adapter;
@@ -115,9 +106,9 @@ private:
 		createInstance();
 		getAdapter();
 		getDevice();
-		getQueue();
-		createBuffer();
 		initializeRenderPipeline();
+		getQueue();
+		initializeBuffers();
 	}
 
 	void createInstance()
@@ -165,75 +156,6 @@ private:
 		}
 	}
 
-	void createBuffer()
-	{
-		WGPUBufferDescriptor bufferDesc = {};
-		bufferDesc.nextInChain = nullptr;
-		bufferDesc.label = "Some GPU-side data buffer";
-		bufferDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc;
-		bufferDesc.size = 16;
-		bufferDesc.mappedAtCreation = false;
-		buffer1 = wgpuDeviceCreateBuffer(device, &bufferDesc);
-
-		bufferDesc.label = "Output buffer";
-		bufferDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
-		buffer2 = wgpuDeviceCreateBuffer(device, &bufferDesc);
-
-		std::vector<uint8_t> numbers(16);
-		for (uint8_t i = 0; i < 16; ++i) numbers[i] = i;
-
-		wgpuQueueWriteBuffer(queue, buffer1, 0, numbers.data(), numbers.size());
-
-		WGPUCommandEncoderDescriptor encoderDesc{};
-		encoderDesc.nextInChain = nullptr;
-		encoderDesc.label = "Command encoder";
-		WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encoderDesc);
-
-		wgpuCommandEncoderCopyBufferToBuffer(encoder, buffer1, 0, buffer2, 0, 16);
-
-		WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, nullptr);
-		wgpuCommandEncoderRelease(encoder);
-		wgpuQueueSubmit(queue, 1, &command);
-		wgpuCommandBufferRelease(command);
-
-		struct Context 
-		{
-			bool ready;
-			WGPUBuffer buffer;
-		};
-
-		auto onBuffer2Mapped = 
-			[](WGPUBufferMapAsyncStatus status, void* pUserData) 
-			{
-				Context* context = reinterpret_cast<Context*>(pUserData);
-				context->ready = true;
-				std::cout << "\nBuffer 2 mapped with status " << status << '\n';
-				if (status != WGPUBufferMapAsyncStatus_Success) return;
-
-				uint8_t* bufferData = (uint8_t*)wgpuBufferGetConstMappedRange(context->buffer, 0, 16);
-
-				std::cout << "bufferData = [";
-				for (int i = 0; i < 16; ++i) {
-					if (i > 0) std::cout << ", ";
-					std::cout << (int)bufferData[i];
-				}
-				std::cout << "]" << std::endl;
-
-				wgpuBufferUnmap(context->buffer);
-			};
-
-		// Create the Context instance
-		Context context{};
-		context.ready = false;
-		context.buffer = buffer2;
-
-		wgpuBufferMapAsync(buffer2, WGPUMapMode_Read, 0, 16, onBuffer2Mapped, (void*)&context);
-
-		while (!context.ready) {
-			wgpuPollEvents(device, true);
-		}
-	}
-
 	void windowLoop()
 	{
 		while (!glfwWindowShouldClose(window))
@@ -254,8 +176,7 @@ private:
 		wgpuQueueRelease(queue);
 		wgpuSurfaceUnconfigure(surface);
 		wgpuSurfaceRelease(surface);
-		wgpuBufferRelease(buffer1);
-		wgpuBufferRelease(buffer2);
+		wgpuBufferRelease(vertexBuffer);
 	}
 
 	void renderFrame()
@@ -274,7 +195,7 @@ private:
 		renderPassColorAttachment.view = targetView;
 		renderPassColorAttachment.loadOp = WGPULoadOp_Clear;
 		renderPassColorAttachment.storeOp = WGPUStoreOp_Store;
-		renderPassColorAttachment.clearValue = WGPUColor{ 0.9, 0.1, 0.2, 1.0 };
+		renderPassColorAttachment.clearValue = WGPUColor{ 0.0, 0.0, 0.0, 1.0 };
 
 		WGPURenderPassDescriptor renderPassDesc = {};
 		renderPassDesc.colorAttachmentCount = 1;
@@ -282,7 +203,8 @@ private:
 		WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDesc);
 
 		wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
-		wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+		wgpuRenderPassEncoderSetVertexBuffer(renderPass, 0, vertexBuffer, 0, wgpuBufferGetSize(vertexBuffer));
+		wgpuRenderPassEncoderDraw(renderPass, vertexCount, 1, 0, 0);
 
 		wgpuRenderPassEncoderEnd(renderPass);
 
@@ -298,6 +220,42 @@ private:
 		
 		wgpuTextureRelease(surfaceTexture.texture);
 		wgpuCommandEncoderRelease(encoder);
+	}
+
+	void initializeBuffers()
+	{
+		std::vector<float> vertexData = {
+			
+			-0.5, -0.5,
+			+0.5, -0.5,
+			+0.5, +0.5,
+
+			+0.5, +0.5,
+			-0.5, +0.5,
+			-0.5, -0.5
+		};
+
+		vertexCount = static_cast<uint32_t>(vertexData.size() / 2);
+
+		WGPUBufferDescriptor vertexBufferDesc{};
+		vertexBufferDesc.nextInChain = nullptr;
+		vertexBufferDesc.label = "Vertex buffer";
+		vertexBufferDesc.size = vertexData.size() * sizeof(float);
+		vertexBufferDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_Vertex;
+		vertexBufferDesc.mappedAtCreation = false;
+		vertexBuffer = wgpuDeviceCreateBuffer(device, &vertexBufferDesc);
+
+		wgpuQueueWriteBuffer(queue, vertexBuffer, 0, vertexData.data(), vertexBufferDesc.size);
+
+		WGPUCommandEncoderDescriptor encoderDesc{};
+		encoderDesc.nextInChain = nullptr;
+		encoderDesc.label = "Command encoder";
+		WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encoderDesc);
+
+		WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, nullptr);
+		wgpuCommandEncoderRelease(encoder);
+		wgpuQueueSubmit(queue, 1, &command);
+		wgpuCommandBufferRelease(command);
 	}
 
 	void getAdapter()
@@ -338,11 +296,12 @@ private:
 
 	void getDevice()
 	{
+		WGPURequiredLimits requiredLimits = getRequiredLimits(adapter);
 		WGPUDeviceDescriptor deviceDesc{};
 		deviceDesc.nextInChain = nullptr;
 		deviceDesc.label = "The device";
 		deviceDesc.requiredFeatureCount = 0;
-		deviceDesc.requiredLimits = nullptr;
+		deviceDesc.requiredLimits = &requiredLimits;
 		deviceDesc.defaultQueue.label = "Default queue";
 		deviceDesc.defaultQueue.nextInChain = nullptr;
 		deviceDesc.deviceLostCallback =
@@ -355,7 +314,6 @@ private:
 
 		device = requestDeviceSync(adapter, &deviceDesc);
 		configSurface();
-		wgpuAdapterRelease(adapter);
 
 		if (!device)
 		{
@@ -386,7 +344,11 @@ private:
 		auto onQueueWorkDone =
 			[](WGPUQueueWorkDoneStatus arg_WorkDoneStatus, void*)
 			{
+#ifdef DEBUG_MODE
 				std::cout << "Queue work finished with status: " << arg_WorkDoneStatus;
+#else
+				(void)arg_WorkDoneStatus;
+#endif
 			};
 
 		wgpuQueueOnSubmittedWorkDone(queue, onQueueWorkDone, nullptr);
@@ -415,7 +377,19 @@ private:
 		WGPUShaderModule shaderModule;
 		createShaderModule(shaderModule);
 
+		WGPUVertexAttribute positionAttrib;
+		positionAttrib.shaderLocation = 0;
+		positionAttrib.format = WGPUVertexFormat_Float32x2;
+		positionAttrib.offset = 0;
+
+		WGPUVertexBufferLayout vertexBufferLayout{};
+		vertexBufferLayout.attributeCount = 1;
+		vertexBufferLayout.attributes = &positionAttrib;
+		vertexBufferLayout.arrayStride = 2 * sizeof(float);
+		vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
+
 		surfaceFormat = wgpuSurfaceGetPreferredFormat(surface, adapter);
+		wgpuAdapterRelease(adapter);
 
 		WGPUBlendState blendState{};
 		blendState.color.srcFactor = WGPUBlendFactor_SrcAlpha;
@@ -433,8 +407,8 @@ private:
 
 		WGPURenderPipelineDescriptor pipelineDesc{};
 		pipelineDesc.nextInChain = nullptr;
-		pipelineDesc.vertex.bufferCount = 0;
-		pipelineDesc.vertex.buffers = nullptr;
+		pipelineDesc.vertex.bufferCount = 1;
+		pipelineDesc.vertex.buffers = &vertexBufferLayout;
 		pipelineDesc.vertex.module = shaderModule;
 		pipelineDesc.vertex.entryPoint = "vs_main";
 		pipelineDesc.vertex.constantCount = 0;
@@ -463,8 +437,45 @@ private:
 		pipeline = wgpuDeviceCreateRenderPipeline(device, &pipelineDesc);
 	}
 
+	void limitsSetDefault(WGPULimits& limits)
+	{
+		limits.maxBindGroups = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxBindGroupsPlusVertexBuffers = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxBindingsPerBindGroup = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxBufferSize = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxColorAttachmentBytesPerSample = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxColorAttachments = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxComputeInvocationsPerWorkgroup = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxComputeWorkgroupSizeX = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxComputeWorkgroupSizeY = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxComputeWorkgroupSizeZ = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxComputeWorkgroupsPerDimension = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxComputeWorkgroupStorageSize = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxDynamicStorageBuffersPerPipelineLayout = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxDynamicUniformBuffersPerPipelineLayout = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxInterStageShaderComponents = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxInterStageShaderVariables = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxSampledTexturesPerShaderStage = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxSamplersPerShaderStage = WGPU_LIMIT_U32_UNDEFINED;
+		// no maxStorageBufferBindingSize
+		limits.maxStorageBuffersPerShaderStage = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxStorageTexturesPerShaderStage = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxTextureArrayLayers = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxTextureDimension1D = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxTextureDimension2D = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxTextureDimension3D = WGPU_LIMIT_U32_UNDEFINED;
+		// no maxUniformBufferBindingSize
+		limits.maxUniformBuffersPerShaderStage = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxVertexAttributes = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxVertexBufferArrayStride = WGPU_LIMIT_U32_UNDEFINED;
+		limits.maxVertexBuffers = WGPU_LIMIT_U32_UNDEFINED;
+		limits.minStorageBufferOffsetAlignment = WGPU_LIMIT_U32_UNDEFINED;
+		limits.minUniformBufferOffsetAlignment = WGPU_LIMIT_U32_UNDEFINED;
+	}
+
 	void logAdapter()
 	{
+#ifdef DEBUG_MODE
 		std::cout << "Adapter features:\n";
 		std::cout << std::hex;
 		for (const WGPUFeatureName feature : adapterFeatures)
@@ -487,10 +498,12 @@ private:
 		std::cout << " - maxTextureDimension2D: " << adapterSupportedLimits.limits.maxTextureDimension2D << '\n';
 		std::cout << " - maxTextureDimension3D: " << adapterSupportedLimits.limits.maxTextureDimension3D << '\n';
 		std::cout << " - maxTextureArrayLayers: " << adapterSupportedLimits.limits.maxTextureArrayLayers << '\n';
+#endif
 	}
 
 	void logDevice()
 	{
+#ifdef DEBUG_MODE
 		std::cout << "Device features:\n";
 		std::cout << std::hex;
 
@@ -505,6 +518,7 @@ private:
 		std::cout << " - maxTextureDimension2D: " << deviceSupportedLimits.limits.maxTextureDimension2D << '\n';
 		std::cout << " - maxTextureDimension3D: " << deviceSupportedLimits.limits.maxTextureDimension3D << '\n';
 		std::cout << " - maxTextureArrayLayers: " << deviceSupportedLimits.limits.maxTextureArrayLayers << '\n';
+#endif
 	}
 
 	std::pair<WGPUSurfaceTexture, WGPUTextureView> getNextSurfaceViewData()
@@ -619,6 +633,23 @@ private:
 
 		return userData.device;
 	}
+
+	WGPURequiredLimits getRequiredLimits(WGPUAdapter arg_Adapter)
+	{
+		(void)arg_Adapter;
+
+		WGPURequiredLimits requiredLimits{};
+		limitsSetDefault(requiredLimits.limits);
+
+		requiredLimits.limits.maxVertexAttributes = 1;
+		requiredLimits.limits.maxVertexBufferArrayStride = 1;
+		requiredLimits.limits.maxBufferSize = 2 * 6 * sizeof(float);
+		requiredLimits.limits.maxVertexBufferArrayStride = 2 * sizeof(float);
+		requiredLimits.limits.minStorageBufferOffsetAlignment = adapterSupportedLimits.limits.minStorageBufferOffsetAlignment;
+		requiredLimits.limits.minUniformBufferOffsetAlignment = adapterSupportedLimits.limits.minUniformBufferOffsetAlignment;
+
+		return requiredLimits;
+	}
 };
 
 int main() try
@@ -632,6 +663,10 @@ int main() try
 }
 catch (const std::exception& err)
 {
+#ifdef DEBUG_MODE
 	std::cerr << err.what();
+#else
+	(void)err;
+#endif
 	return EXIT_FAILURE;
 }
